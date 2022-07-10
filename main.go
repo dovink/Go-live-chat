@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/gorilla/mux"
+	"io"
 	"log"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,6 +19,8 @@ type Channel struct {
 
 	closingClients chan chan []byte
 
+	ClosingOne chan chan []byte
+
 	clients map[chan []byte]bool
 }
 
@@ -25,14 +30,21 @@ func NewChannel() (chanel *Channel) {
 		Notifier:       make(chan []byte, 1),
 		newClients:     make(chan chan []byte),
 		closingClients: make(chan chan []byte),
+		ClosingOne:     make(chan chan []byte),
 		clients:        make(map[chan []byte]bool),
 	}
 
 	go chanel.listen()
+
 	return
 }
 
-var id int
+var mapMutex = sync.Mutex{}
+
+var i int64 = 0
+
+var id int64
+
 var event string
 
 var server = NewChannel()
@@ -40,29 +52,43 @@ var server = NewChannel()
 var chans [10]*Channel
 
 var url [10]string
-var chanid int
+
+var chanid int64 = 0
 
 type Message struct {
-	ID      int    `json:"id"`
+	ID      int64  `json:"id"`
 	Event   string `json:"event"`
 	Message string `json:"msg"`
+}
+
+func contains(s [10]string, str string) bool {
+	for _, v := range s {
+		if v == str {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (channel *Channel) listen() {
 	for {
 		select {
 		case s := <-channel.newClients:
-
 			channel.clients[s] = true
 			log.Printf("Client added. %d registered clients", len(channel.clients))
-		case s := <-channel.closingClients:
+		case <-channel.closingClients:
+			for close := range channel.clients {
+				delete(channel.clients, close)
+				log.Printf("Removed client. %d registered clients", len(channel.clients))
+			}
 
+		case s := <-channel.ClosingOne:
 			delete(channel.clients, s)
 			log.Printf("Removed client. %d registered clients", len(channel.clients))
 
 		case event := <-channel.Notifier:
-
-			for clientMessageChan, _ := range channel.clients {
+			for clientMessageChan := range channel.clients {
 				clientMessageChan <- event
 			}
 		}
@@ -71,45 +97,60 @@ func (channel *Channel) listen() {
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
+	mapMutex.Lock()
 	vars := mux.Vars(r)
 	param := vars["topic"]
 
-	for i := 0; i <= chanid+1; i++ {
-		if url[i] != param {
-			url[i] = param
-			chans[i] = NewChannel()
-			server = chans[i]
-			chanid++
-			break
-		}
+	for i = 0; i <= chanid; i++ {
 		if url[i] == param {
 			server = chans[i]
 			break
-
 		}
 	}
+	if !contains(url, param) {
+		atomic.AddInt64(&chanid, 1)
+		url[chanid] = param
+		chans[chanid] = NewChannel()
+		server = chans[chanid]
+	}
+	mapMutex.Unlock()
 	if r.Method == http.MethodPost {
-		var msg Message
-
-		_ = json.NewDecoder(r.Body).Decode(&msg)
 
 		w.WriteHeader(http.StatusNoContent)
 
-		id++
+		var msg Message
+
+		err := json.NewDecoder(r.Body).Decode(&msg)
+
+		if err != nil {
+			http.Error(w, "err", http.StatusInternalServerError)
+		}
+
+		atomic.AddInt64(&id, 1)
 		msg.ID = id
 		event = "msg"
 		msg.Event = event
+		j, err := json.Marshal(msg)
+		if err != nil {
+			http.Error(w, "err", http.StatusInternalServerError)
+		}
 
-		j, _ := json.Marshal(msg)
-		server.Notifier <- []byte(j)
-		json.NewEncoder(w).Encode(msg)
+		mapMutex.Lock()
+		server.Notifier <- j
+		mapMutex.Unlock()
+
+		err = json.NewEncoder(w).Encode(msg)
+		if err != nil {
+			io.EOF.Error()
+
+		}
 	}
 	if r.Method == http.MethodGet {
+
 		flusher, err := w.(http.Flusher)
 
 		if !err {
 			http.Error(w, "Bad stream", http.StatusInternalServerError)
-			return
 		}
 
 		w.Header().Set("Cache-Control", "no-cache")
@@ -118,37 +159,52 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 		messageChan := make(chan []byte)
 
+		mapMutex.Lock()
 		server.newClients <- messageChan
+		mapMutex.Unlock()
 
-		defer func() {
-			server.closingClients <- messageChan
-		}()
+		q := make(chan bool)
 
 		const interval = 30 * time.Second
+
 		go func() {
+
+			mapMutex.Lock()
+			currentChannel := server
+			mapMutex.Unlock()
+
 			time.Sleep(interval)
+
 			var msg Message
-			msg.ID = id
+			msg.ID = atomic.LoadInt64(&id)
 			msg.Event = "timeout"
 			msg.Message = "30"
-			j, _ := json.Marshal(msg)
-			server.Notifier <- []byte(j)
-			server.closingClients <- messageChan
-		}()
 
-		notify := w.(http.CloseNotifier).CloseNotify()
+			j, err := json.Marshal(msg)
+			if err != nil {
+				http.Error(w, "err", http.StatusInternalServerError)
+			}
 
-		go func() {
-			<-notify
-			server.closingClients <- messageChan
+			currentChannel.Notifier <- j
+
+			currentChannel.closingClients <- messageChan
+
+			q <- true
 
 		}()
 
 		for {
+			select {
+			case message := <-messageChan:
+				_, err := fmt.Fprintf(w, "%s\n", message)
+				if err != nil {
+					http.Error(w, "err", http.StatusInternalServerError)
+				}
+				flusher.Flush()
 
-			fmt.Fprintf(w, "data: %s\n\n", <-messageChan)
-
-			flusher.Flush()
+			case <-q:
+				return
+			}
 		}
 	}
 }
@@ -156,5 +212,5 @@ func handle(w http.ResponseWriter, r *http.Request) {
 func main() {
 	router := mux.NewRouter()
 	router.HandleFunc("/infocenter/{topic}", handle).Methods(http.MethodGet, http.MethodPost)
-	log.Fatal(http.ListenAndServe(":8000", router))
+	log.Fatal(http.ListenAndServe(":8080", router))
 }
